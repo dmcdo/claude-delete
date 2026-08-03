@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Clone local Claude Code session files (~/.claude/projects/<project>/*.jsonl)."""
+
+import argparse
+import json
+import re
+import shutil
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+import os
+
+
+def config_dir() -> Path:
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(override).expanduser() if override else Path.home() / ".claude"
+
+
+def projects_root() -> Path:
+    return config_dir() / "projects"
+
+
+def slugify_cwd(path: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def resolve_project_dir(explicit: str | None) -> Path:
+    root = projects_root()
+
+    if explicit:
+        candidate = root / explicit
+        if candidate.is_dir():
+            return candidate
+        candidate = Path(explicit).expanduser()
+        if candidate.is_dir():
+            return candidate
+        sys.exit(f"error: project '{explicit}' not found under {root}")
+
+    guess = root / slugify_cwd(Path.cwd())
+    if guess.is_dir():
+        return guess
+
+    if not root.is_dir():
+        sys.exit(f"error: no Claude projects directory found at {root}")
+
+    candidates = sorted(
+        (p for p in root.iterdir() if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        sys.exit(f"error: no projects found under {root}")
+
+    print(f"Could not match current directory to a project under {root}.")
+    print("Available projects (most recently active first):")
+    for i, c in enumerate(candidates, 1):
+        print(f"  {i}. {c.name}")
+    choice = input("Select a project by number: ").strip()
+    try:
+        idx = int(choice) - 1
+        if not 0 <= idx < len(candidates):
+            raise ValueError
+    except ValueError:
+        sys.exit("error: invalid selection")
+    return candidates[idx]
+
+
+def resolve_dest_project_dir(explicit: str | None) -> Path | None:
+    """Resolves --to into a destination project dir. Returns None if not given
+    (caller should then clone alongside each source session's own project)."""
+    if not explicit:
+        return None
+
+    root = projects_root()
+    candidate = root / explicit
+    if candidate.is_dir():
+        return candidate
+
+    path = Path(explicit).expanduser()
+    if path.is_dir():
+        return root / slugify_cwd(path.resolve())
+
+    # Not an existing project dir or source path: treat as a literal slug to
+    # create under the projects root (mirrors how Claude Code names new ones).
+    return root / explicit
+
+
+def human_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def first_user_preview(jsonl_path: Path, max_len: int = 70) -> str:
+    try:
+        with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "user":
+                    continue
+                content = obj.get("message", {}).get("content")
+                text = None
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text")
+                            break
+                if text:
+                    text = re.sub(r"<local-command-caveat>.*?</local-command-caveat>", "", text, flags=re.DOTALL)
+                    text = " ".join(text.split())
+                    return text[:max_len] + ("..." if len(text) > max_len else "")
+    except OSError:
+        pass
+    return "(no preview available)"
+
+
+def count_lines(path: Path) -> int:
+    try:
+        with path.open("rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+def all_project_dirs(root: Path) -> list[Path]:
+    if not root.is_dir():
+        sys.exit(f"error: no Claude projects directory found at {root}")
+    dirs = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not dirs:
+        sys.exit(f"error: no projects found under {root}")
+    return dirs
+
+
+def list_sessions(project_dir: Path):
+    """Returns (project_dir, session_file) pairs for a single project, newest first."""
+    files = sorted(project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [(project_dir, f) for f in files]
+
+
+def gather_sessions(project_dirs: list[Path]):
+    """Returns (project_dir, session_file) pairs across multiple projects, newest first."""
+    pairs = [pair for pd in project_dirs for pair in list_sessions(pd)]
+    pairs.sort(key=lambda pair: pair[1].stat().st_mtime, reverse=True)
+    return pairs
+
+
+def resolve_sessions(args):
+    """Returns (header, sessions) where sessions is a list of (project_dir, session_file) pairs."""
+    if args.all:
+        if args.project:
+            sys.exit("error: --all and --project are mutually exclusive")
+        return "All projects", gather_sessions(all_project_dirs(projects_root()))
+    project_dir = resolve_project_dir(args.project)
+    return f"Project: {project_dir.name}", list_sessions(project_dir)
+
+
+def print_sessions(sessions, show_project: bool):
+    if not sessions:
+        print("No sessions found.")
+        return
+    for i, (project_dir, s) in enumerate(sessions, 1):
+        stat = s.stat()
+        mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        print(f"[{i}] {s.stem}")
+        if show_project:
+            print(f"     project:  {project_dir.name}")
+        print(f"     modified: {mtime}   size: {human_size(stat.st_size)}   messages: {count_lines(s)}")
+        print(f"     preview:  {first_user_preview(s)}")
+
+
+def resolve_selector(sessions, selector: str):
+    if selector.isdigit():
+        idx = int(selector)
+        if 1 <= idx <= len(sessions):
+            return [sessions[idx - 1]]
+        return []
+
+    matches = [pair for pair in sessions if pair[1].stem == selector or pair[1].stem.startswith(selector)]
+    seen, unique = set(), []
+    for m in matches:
+        if m[1] not in seen:
+            unique.append(m)
+            seen.add(m[1])
+    return unique
+
+
+def resolve_targets(sessions, selectors: list[str]):
+    """Resolves multiple selectors (or 'all') to a deduped, ordered list of (project_dir, session_file)."""
+    if any(s.strip().lower() == "all" for s in selectors):
+        if len(selectors) > 1:
+            sys.exit("error: 'all' cannot be combined with other selectors")
+        return list(sessions)
+
+    seen, targets = set(), []
+    for selector in selectors:
+        matches = resolve_selector(sessions, selector)
+        if not matches:
+            sys.exit(f"error: no session matches '{selector}'")
+        if len(matches) > 1:
+            print(f"'{selector}' matches multiple sessions:")
+            for _, t in matches:
+                print(f"  {t.stem}")
+            sys.exit("error: be more specific")
+        project_dir, session_file = matches[0]
+        if session_file not in seen:
+            targets.append(matches[0])
+            seen.add(session_file)
+    return targets
+
+
+def rewrite_session_id(path: Path, old_id: str, new_id: str):
+    """Replaces the exact `"sessionId":"<old_id>"` tag throughout a jsonl file.
+
+    Session transcripts (main and subagent) embed the session id on every
+    line; a plain file copy would leave two files claiming the same id, which
+    confuses history/resume. Byte-level replace of the exact quoted tag keeps
+    the rest of the file (including any non-ASCII text) untouched."""
+    old_tag = f'"sessionId":"{old_id}"'.encode()
+    new_tag = f'"sessionId":"{new_id}"'.encode()
+    data = path.read_bytes()
+    path.write_bytes(data.replace(old_tag, new_tag))
+
+
+def clone_session(project_dir: Path, session_file: Path, dest_project_dir: Path, dry_run: bool) -> str:
+    old_id = session_file.stem
+    new_id = str(uuid.uuid4())
+    dest_file = dest_project_dir / f"{new_id}.jsonl"
+    side_dir = project_dir / old_id
+    dest_side_dir = dest_project_dir / new_id if side_dir.is_dir() else None
+
+    if dry_run:
+        print(f"  would clone: {session_file} -> {dest_file}")
+        if dest_side_dir:
+            print(f"  would clone: {side_dir} -> {dest_side_dir}")
+        return new_id
+
+    dest_project_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(session_file, dest_file)
+    rewrite_session_id(dest_file, old_id, new_id)
+    print(f"  cloned: {dest_file}")
+
+    if dest_side_dir:
+        shutil.copytree(side_dir, dest_side_dir)
+        for jsonl in dest_side_dir.rglob("*.jsonl"):
+            rewrite_session_id(jsonl, old_id, new_id)
+        print(f"  cloned: {dest_side_dir}")
+
+    return new_id
+
+
+def cmd_list(args):
+    header, sessions = resolve_sessions(args)
+    print(f"{header}\n")
+    print_sessions(sessions, show_project=args.all)
+
+
+def cmd_clone(args):
+    _, sessions = resolve_sessions(args)
+    if not sessions:
+        sys.exit("No sessions found.")
+
+    targets = resolve_targets(sessions, args.session)
+    dest_override = resolve_dest_project_dir(args.to)
+
+    plural = len(targets) > 1
+    print(f"{len(targets)} session(s) selected for cloning:" if plural else "Session:")
+    for project_dir, target in targets:
+        dest_project_dir = dest_override or project_dir
+        print(f"  {target.stem}")
+        if args.all or args.to:
+            print(f"    project:     {project_dir.name}")
+        if dest_override:
+            print(f"    destination: {dest_project_dir.name}")
+        print(f"    modified: {datetime.fromtimestamp(target.stat().st_mtime)}")
+        print(f"    preview:  {first_user_preview(target)}")
+
+    if plural and not args.dry_run and not args.yes:
+        confirm = input(f"\nClone {len(targets)} sessions? [y/N] ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    for project_dir, target in targets:
+        dest_project_dir = dest_override or project_dir
+        if plural:
+            print(f"\n{target.stem}:")
+        new_id = clone_session(project_dir, target, dest_project_dir, args.dry_run)
+        if not args.dry_run:
+            print(f"  -> {new_id}")
+
+
+def cmd_interactive(args):
+    header, sessions = resolve_sessions(args)
+    print(f"{header}\n")
+    print_sessions(sessions, show_project=args.all)
+    if not sessions:
+        return
+
+    choice = input(
+        "\nEnter number(s)/id prefix(es) to clone (comma-separated), 'all', or blank to quit: "
+    ).strip()
+    if not choice:
+        return
+
+    selectors = [s.strip() for s in choice.split(",") if s.strip()]
+    targets = resolve_targets(sessions, selectors)
+
+    if len(targets) > 1:
+        confirm = input(f"Clone {len(targets)} sessions? [y/N] ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    for project_dir, target in targets:
+        if len(targets) > 1:
+            print(f"\n{target.stem}:")
+        new_id = clone_session(project_dir, target, project_dir, dry_run=False)
+        print(f"  -> {new_id}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="List and clone local Claude Code sessions.",
+        epilog="Note: --project must come before the subcommand, e.g. 'main.py --project foo list'.",
+    )
+    parser.add_argument("--project", help="Project dir name under ~/.claude/projects, or a path to the project's source directory")
+    parser.add_argument("--all", action="store_true", help="Show sessions across all projects, not just the current one")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("list", help="List sessions for a project").set_defaults(func=cmd_list)
+
+    p_clone = sub.add_parser("clone", help="Clone one or more sessions")
+    p_clone.add_argument(
+        "session",
+        nargs="+",
+        help="Session number(s) (from list), full session id(s), id prefix(es), or 'all' to clone every listed session",
+    )
+    p_clone.add_argument("--to", metavar="PROJECT", help="Clone into a different project (dir name under ~/.claude/projects, or a path to a project's source directory), instead of alongside the original")
+    p_clone.add_argument("--dry-run", action="store_true", help="Show what would be cloned without cloning")
+    p_clone.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt when cloning multiple sessions")
+    p_clone.set_defaults(func=cmd_clone)
+
+    args = parser.parse_args()
+    try:
+        if args.command is None:
+            cmd_interactive(args)
+        else:
+            args.func(args)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
