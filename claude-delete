@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""List and delete local Claude Code session files (~/.claude/projects/<project>/*.jsonl)."""
+
+import argparse
+import json
+import re
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+import os
+
+
+def config_dir() -> Path:
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(override).expanduser() if override else Path.home() / ".claude"
+
+
+def projects_root() -> Path:
+    return config_dir() / "projects"
+
+
+def slugify_cwd(path: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def resolve_project_dir(explicit: str | None) -> Path:
+    root = projects_root()
+
+    if explicit:
+        candidate = root / explicit
+        if candidate.is_dir():
+            return candidate
+        candidate = Path(explicit).expanduser()
+        if candidate.is_dir():
+            return candidate
+        sys.exit(f"error: project '{explicit}' not found under {root}")
+
+    guess = root / slugify_cwd(Path.cwd())
+    if guess.is_dir():
+        return guess
+
+    if not root.is_dir():
+        sys.exit(f"error: no Claude projects directory found at {root}")
+
+    candidates = sorted(
+        (p for p in root.iterdir() if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        sys.exit(f"error: no projects found under {root}")
+
+    print(f"Could not match current directory to a project under {root}.")
+    print("Available projects (most recently active first):")
+    for i, c in enumerate(candidates, 1):
+        print(f"  {i}. {c.name}")
+    choice = input("Select a project by number: ").strip()
+    try:
+        idx = int(choice) - 1
+        if not 0 <= idx < len(candidates):
+            raise ValueError
+    except ValueError:
+        sys.exit("error: invalid selection")
+    return candidates[idx]
+
+
+def human_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def first_user_preview(jsonl_path: Path, max_len: int = 70) -> str:
+    try:
+        with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "user":
+                    continue
+                content = obj.get("message", {}).get("content")
+                text = None
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text")
+                            break
+                if text:
+                    text = re.sub(r"<local-command-caveat>.*?</local-command-caveat>", "", text, flags=re.DOTALL)
+                    text = " ".join(text.split())
+                    return text[:max_len] + ("..." if len(text) > max_len else "")
+    except OSError:
+        pass
+    return "(no preview available)"
+
+
+def count_lines(path: Path) -> int:
+    try:
+        with path.open("rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+def all_project_dirs(root: Path) -> list[Path]:
+    if not root.is_dir():
+        sys.exit(f"error: no Claude projects directory found at {root}")
+    dirs = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not dirs:
+        sys.exit(f"error: no projects found under {root}")
+    return dirs
+
+
+def list_sessions(project_dir: Path):
+    """Returns (project_dir, session_file) pairs for a single project, newest first."""
+    files = sorted(project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [(project_dir, f) for f in files]
+
+
+def gather_sessions(project_dirs: list[Path]):
+    """Returns (project_dir, session_file) pairs across multiple projects, newest first."""
+    pairs = [pair for pd in project_dirs for pair in list_sessions(pd)]
+    pairs.sort(key=lambda pair: pair[1].stat().st_mtime, reverse=True)
+    return pairs
+
+
+def resolve_sessions(args):
+    """Returns (header, sessions) where sessions is a list of (project_dir, session_file) pairs."""
+    if args.all:
+        if args.project:
+            sys.exit("error: --all and --project are mutually exclusive")
+        return "All projects", gather_sessions(all_project_dirs(projects_root()))
+    project_dir = resolve_project_dir(args.project)
+    return f"Project: {project_dir.name}", list_sessions(project_dir)
+
+
+def print_sessions(sessions, show_project: bool):
+    if not sessions:
+        print("No sessions found.")
+        return
+    for i, (project_dir, s) in enumerate(sessions, 1):
+        stat = s.stat()
+        mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        print(f"[{i}] {s.stem}")
+        if show_project:
+            print(f"     project:  {project_dir.name}")
+        print(f"     modified: {mtime}   size: {human_size(stat.st_size)}   messages: {count_lines(s)}")
+        print(f"     preview:  {first_user_preview(s)}")
+
+
+def resolve_selector(sessions, selector: str):
+    if selector.isdigit():
+        idx = int(selector)
+        if 1 <= idx <= len(sessions):
+            return [sessions[idx - 1]]
+        return []
+
+    matches = [pair for pair in sessions if pair[1].stem == selector or pair[1].stem.startswith(selector)]
+    seen, unique = set(), []
+    for m in matches:
+        if m[1] not in seen:
+            unique.append(m)
+            seen.add(m[1])
+    return unique
+
+
+def resolve_targets(sessions, selectors: list[str]):
+    """Resolves multiple selectors (or 'all') to a deduped, ordered list of (project_dir, session_file)."""
+    if any(s.strip().lower() == "all" for s in selectors):
+        if len(selectors) > 1:
+            sys.exit("error: 'all' cannot be combined with other selectors")
+        return list(sessions)
+
+    seen, targets = set(), []
+    for selector in selectors:
+        matches = resolve_selector(sessions, selector)
+        if not matches:
+            sys.exit(f"error: no session matches '{selector}'")
+        if len(matches) > 1:
+            print(f"'{selector}' matches multiple sessions:")
+            for _, t in matches:
+                print(f"  {t.stem}")
+            sys.exit("error: be more specific")
+        project_dir, session_file = matches[0]
+        if session_file not in seen:
+            targets.append(matches[0])
+            seen.add(session_file)
+    return targets
+
+
+def delete_session(project_dir: Path, session_file: Path, dry_run: bool):
+    side_dir = project_dir / session_file.stem
+    targets = [session_file] + ([side_dir] if side_dir.is_dir() else [])
+    for t in targets:
+        if dry_run:
+            print(f"  would remove: {t}")
+        else:
+            shutil.rmtree(t) if t.is_dir() else t.unlink()
+            print(f"  removed: {t}")
+
+
+def cmd_list(args):
+    header, sessions = resolve_sessions(args)
+    print(f"{header}\n")
+    print_sessions(sessions, show_project=args.all)
+
+
+def cmd_delete(args):
+    _, sessions = resolve_sessions(args)
+    if not sessions:
+        sys.exit("No sessions found.")
+
+    targets = resolve_targets(sessions, args.session)
+
+    plural = len(targets) > 1
+    print(f"{len(targets)} session(s) selected for deletion:" if plural else "Session:")
+    for project_dir, target in targets:
+        print(f"  {target.stem}")
+        if args.all:
+            print(f"    project:  {project_dir.name}")
+        print(f"    modified: {datetime.fromtimestamp(target.stat().st_mtime)}")
+        print(f"    preview:  {first_user_preview(target)}")
+
+    if plural and not args.dry_run and not args.yes:
+        confirm = input(f"\nDelete {len(targets)} sessions? [y/N] ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    for project_dir, target in targets:
+        if plural:
+            print(f"\n{target.stem}:")
+        delete_session(project_dir, target, args.dry_run)
+
+
+def cmd_interactive(args):
+    header, sessions = resolve_sessions(args)
+    print(f"{header}\n")
+    print_sessions(sessions, show_project=args.all)
+    if not sessions:
+        return
+
+    choice = input(
+        "\nEnter number(s)/id prefix(es) to delete (comma-separated), 'all', or blank to quit: "
+    ).strip()
+    if not choice:
+        return
+
+    selectors = [s.strip() for s in choice.split(",") if s.strip()]
+    targets = resolve_targets(sessions, selectors)
+
+    if len(targets) > 1:
+        confirm = input(f"Delete {len(targets)} sessions? [y/N] ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    for project_dir, target in targets:
+        if len(targets) > 1:
+            print(f"\n{target.stem}:")
+        delete_session(project_dir, target, dry_run=False)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="List and delete local Claude Code sessions.",
+        epilog="Note: --project must come before the subcommand, e.g. 'main.py --project foo list'.",
+    )
+    parser.add_argument("--project", help="Project dir name under ~/.claude/projects, or a path to the project's source directory")
+    parser.add_argument("--all", action="store_true", help="Show sessions across all projects, not just the current one")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("list", help="List sessions for a project").set_defaults(func=cmd_list)
+
+    p_delete = sub.add_parser("delete", help="Delete one or more sessions")
+    p_delete.add_argument(
+        "session",
+        nargs="+",
+        help="Session number(s) (from list), full session id(s), id prefix(es), or 'all' to delete every listed session",
+    )
+    p_delete.add_argument("--dry-run", action="store_true", help="Show what would be deleted without deleting")
+    p_delete.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt when deleting multiple sessions")
+    p_delete.set_defaults(func=cmd_delete)
+
+    args = parser.parse_args()
+    try:
+        if args.command is None:
+            cmd_interactive(args)
+        else:
+            args.func(args)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
